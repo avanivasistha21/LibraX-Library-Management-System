@@ -202,9 +202,10 @@ librax/
 | API contract (`LibraryApi` interface) | ✅ Defined in `src/services/api.ts` |
 | HTTP client (`httpApi`) | ✅ Activated by setting `VITE_API_BASE_URL` |
 | Mock fallback (`mockApi`) | ✅ Active when `VITE_API_BASE_URL` is empty |
-| Environment variable wiring | ✅ `.env.example` provided |
+| Environment variable wiring | ✅ `.env.example` provided with CORS notes |
+| Auth headers & 401 interception | ✅ Auto Bearer token dispatch + 401 redirect to `/login` |
 | Backend server | ⏳ Not yet implemented |
-| Authentication (JWT / session) | ⏳ Role switcher is demo-only |
+| Authentication backend (JWT / session) | ⏳ Demo role switcher; wire token via `setToken()` |
 | Pagination / server-side filtering | ⏳ Pages currently load a full snapshot |
 | Real-time / websocket updates | ⏳ Not implemented |
 
@@ -219,7 +220,7 @@ The frontend communicates exclusively through the `LibraryApi` interface in `src
 | `GET` | `/library/snapshot` | Returns all entities (books, copies, members, borrows, reservations, fines, activity) |
 | `POST` | `/books` | Create a new book title |
 | `PATCH` | `/books/:id` | Update book metadata |
-| `DELETE` | `/books/:id` | Remove a book title |
+| `DELETE` | `/books/:id` | Remove a book title (204 No Content supported) |
 | `PATCH` | `/book-copies/:id` | Update a physical copy's status |
 | `POST` | `/members` | Register a new member |
 | `POST` | `/borrows` | Issue a book copy to a member |
@@ -228,7 +229,7 @@ The frontend communicates exclusively through the `LibraryApi` interface in `src
 | `PATCH` | `/reservations/:id` | Update reservation status |
 | `PATCH` | `/fines/:id` | Update fine payment status |
 
-All responses are JSON. Errors use non-2xx status codes and may include a `{ message, code }` body.
+All requests include `Content-Type: application/json` and automatically attach `Authorization: Bearer <token>` when an auth token is set. Responses are JSON (or 204 No Content for empty DELETE responses). If a `401 Unauthorized` status is received, the frontend automatically purges stored tokens and routes to `/login`. Errors use non-2xx status codes and may include an error body.
 
 > When the backend is ready, set `VITE_API_BASE_URL` in `.env` — the frontend automatically switches from mock to live data.
 

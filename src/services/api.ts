@@ -15,11 +15,56 @@ export interface LibraryApi {
 }
 
 const baseUrl = import.meta.env.VITE_API_BASE_URL?.replace(/\/$/, '')
+const TOKEN_KEY = 'librax_auth_token'
+
+export function getAuthToken(): string | null {
+  if (typeof window === 'undefined') return null
+  return localStorage.getItem(TOKEN_KEY)
+}
+
+export function setAuthToken(token: string): void {
+  if (typeof window !== 'undefined') {
+    localStorage.setItem(TOKEN_KEY, token)
+  }
+}
+
+export function clearAuthToken(): void {
+  if (typeof window !== 'undefined') {
+    localStorage.removeItem(TOKEN_KEY)
+  }
+}
 
 async function request<T>(path: string, options?: RequestInit): Promise<T> {
   if (!baseUrl) throw new Error('API base URL is not configured.')
-  const response = await fetch(`${baseUrl}${path}`, { ...options, headers: { 'Content-Type': 'application/json', ...options?.headers } })
-  if (!response.ok) throw new Error(`API request failed with ${response.status}`)
+  const token = getAuthToken()
+  const headers: Record<string, string> = {
+    'Content-Type': 'application/json',
+    ...(token ? { Authorization: `Bearer ${token}` } : {}),
+    ...((options?.headers as Record<string, string>) ?? {}),
+  }
+
+  const response = await fetch(`${baseUrl}${path}`, {
+    ...options,
+    headers,
+  })
+
+  if (response.status === 401) {
+    clearAuthToken()
+    if (typeof window !== 'undefined' && window.location.pathname !== '/login') {
+      window.location.href = '/login'
+    }
+    throw new Error('Unauthorized: Session expired or invalid token.')
+  }
+
+  if (!response.ok) {
+    const errorBody = await response.text().catch(() => '')
+    throw new Error(`API request failed with status ${response.status}${errorBody ? `: ${errorBody}` : ''}`)
+  }
+
+  if (response.status === 204) {
+    return undefined as unknown as T
+  }
+
   return response.json() as Promise<T>
 }
 
