@@ -1,6 +1,43 @@
-import { Database, KeyRound, SlidersHorizontal, ToggleLeft } from 'lucide-react'
-import { useState } from 'react'
-import { Badge, Button, Field, Input, SectionHeading, Select } from '@/components/ui'
+import { KeyRound, ShieldCheck } from 'lucide-react'
+import { useState, type FormEvent } from 'react'
+import { changePassword } from '@/services/api'
+import { Button, Field, Input, SectionHeading } from '@/components/ui'
 
-export function SettingsPage() { const [apiUrl, setApiUrl] = useState(''); const [dense, setDense] = useState(false); const [autoFine, setAutoFine] = useState(true); const [saved, setSaved] = useState(false); return <div className="max-w-4xl space-y-6 fade-up"><div><p className="label text-clay">Workspace / Settings</p><h2 className="mt-1 font-display text-2xl font-semibold tracking-[-0.04em]">Set the operating rhythm.</h2><p className="mt-2 text-sm text-slate-500">Configure the service connection and display preferences.</p></div><div className="grid gap-6 lg:grid-cols-2"><div className="rounded-2xl border border-line bg-white p-6"><SectionHeading eyebrow="Connection" title="Backend boundary" /><div className="space-y-5"><Field label="API base URL" hint="Saved as VITE_API_BASE_URL in the deployed frontend environment."><Input value={apiUrl} onChange={(event) => setApiUrl(event.target.value)} placeholder="https://api.librax.edu/v1" /></Field><div className="rounded-xl bg-fog p-4"><div className="flex items-center gap-2"><Database className="h-4 w-4 text-moss" /><p className="text-sm font-semibold text-ink">MySQL is not exposed here</p></div><p className="mt-2 text-xs leading-5 text-slate-500">The browser calls a typed REST/JDBC adapter only. Database credentials belong to the backend runtime.</p></div><div className="flex items-center justify-between rounded-xl border border-line p-3"><div className="flex items-center gap-3"><KeyRound className="h-4 w-4 text-slate-400" /><div><p className="text-sm font-semibold text-ink">Service status</p><p className="mt-1 text-xs text-slate-400">Ready for requests</p></div></div><Badge tone="green">Connected</Badge></div></div></div><div className="rounded-2xl border border-line bg-white p-6"><SectionHeading eyebrow="Workspace feel" title="Service preferences" /><div className="space-y-2"><button onClick={() => setDense(!dense)} className="flex w-full items-center justify-between rounded-xl border border-line p-4 text-left hover:bg-fog"><div className="flex items-center gap-3"><SlidersHorizontal className="h-4 w-4 text-clay" /><div><p className="text-sm font-semibold text-ink">Dense table rows</p><p className="mt-1 text-xs text-slate-400">Fit more records on desktop screens</p></div></div><Toggle active={dense} /></button><button onClick={() => setAutoFine(!autoFine)} className="flex w-full items-center justify-between rounded-xl border border-line p-4 text-left hover:bg-fog"><div className="flex items-center gap-3"><ToggleLeft className="h-4 w-4 text-moss" /><div><p className="text-sm font-semibold text-ink">Auto-assess overdue fines</p><p className="mt-1 text-xs text-slate-400">Create a fine when an overdue copy returns</p></div></div><Toggle active={autoFine} /></button><Field label="Default display role"><Select className="w-full"><option>Administrator</option><option>Librarian</option><option>Member</option></Select></Field></div></div></div><div className="flex items-center justify-end gap-3"><span className="text-xs text-moss">{saved ? 'Preferences saved locally.' : ''}</span><Button onClick={() => { setSaved(true); setTimeout(() => setSaved(false), 2500) }}>Save preferences</Button></div></div> }
-function Toggle({ active }: { active: boolean }) { return <span className={`relative h-5 w-9 rounded-full transition ${active ? 'bg-moss' : 'bg-line'}`}><span className={`absolute top-1 h-3 w-3 rounded-full bg-white transition ${active ? 'left-5' : 'left-1'}`} /></span> }
+export function SettingsPage() {
+  const [currentPassword, setCurrentPassword] = useState('')
+  const [newPassword, setNewPassword] = useState('')
+  const [confirmPassword, setConfirmPassword] = useState('')
+  const [message, setMessage] = useState('')
+  const [error, setError] = useState('')
+  const [pending, setPending] = useState(false)
+  const submit = async (event: FormEvent) => {
+    event.preventDefault()
+    setMessage('')
+    setError('')
+    if (newPassword !== confirmPassword) { setError('The new passwords do not match.'); return }
+    setPending(true)
+    try {
+      await changePassword(currentPassword, newPassword)
+      setMessage('Your password has been updated.')
+      setCurrentPassword('')
+      setNewPassword('')
+      setConfirmPassword('')
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message.replace(/^API request failed with status \d+:\s*/, '') : 'Password update failed.')
+    } finally { setPending(false) }
+  }
+  return <div className="max-w-3xl space-y-6 fade-up">
+    <div><p className="label text-clay">Account security</p><h2 className="mt-1 font-display text-2xl font-semibold tracking-[-0.04em]">Your account, securely yours.</h2><p className="mt-2 text-sm text-slate-500">Change the password used to sign in to this account.</p></div>
+    <form onSubmit={(event) => void submit(event)} className="rounded-2xl border border-line bg-white p-6 shadow-[0_8px_24px_rgba(23,32,43,0.03)] sm:p-8">
+      <SectionHeading eyebrow="Password" title="Update sign-in credentials" />
+      <div className="max-w-xl space-y-5">
+        <Field label="Current password"><div className="relative"><KeyRound className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-400" /><Input className="pl-10" type="password" autoComplete="current-password" required value={currentPassword} onChange={(event) => setCurrentPassword(event.target.value)} /></div></Field>
+        <Field label="New password" hint="Use at least 8 characters."><Input type="password" minLength={8} autoComplete="new-password" required value={newPassword} onChange={(event) => setNewPassword(event.target.value)} /></Field>
+        <Field label="Confirm new password"><Input type="password" minLength={8} autoComplete="new-password" required value={confirmPassword} onChange={(event) => setConfirmPassword(event.target.value)} /></Field>
+      </div>
+      {message && <p role="status" className="mt-5 flex items-center gap-2 text-sm text-moss"><ShieldCheck className="h-4 w-4" />{message}</p>}
+      {error && <p role="alert" className="mt-5 text-sm text-red-700">{error}</p>}
+      <div className="mt-7 flex justify-end border-t border-line pt-5"><Button type="submit" disabled={pending || newPassword.length < 8 || !currentPassword}>{pending ? 'Updating…' : 'Update password'}</Button></div>
+    </form>
+  </div>
+}

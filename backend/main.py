@@ -1,9 +1,13 @@
+import hashlib
+import hmac
 import os
+import secrets
 import uuid
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 from fastapi import FastAPI, HTTPException, Request, Response, status
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from db import (
@@ -42,6 +46,184 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+AUTH_ITERATIONS = 310_000
+SESSION_DAYS = 7
+
+class LoginRequest(BaseModel):
+    email: str
+    password: str
+
+class PasswordChangeRequest(BaseModel):
+    currentPassword: str
+    newPassword: str = Field(min_length=8)
+
+class AuthenticatedUser(BaseModel):
+    id: str
+    entityId: str
+    name: str
+    email: str
+    role: str
+
+def password_digest(password: str, salt: str) -> str:
+    return hashlib.pbkdf2_hmac("sha256", password.encode(), bytes.fromhex(salt), AUTH_ITERATIONS).hex()
+
+def create_auth_schema() -> None:
+    conn = get_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("""CREATE TABLE IF NOT EXISTS USER_ACCOUNT (
+            account_id VARCHAR(50) PRIMARY KEY, email VARCHAR(255) NOT NULL UNIQUE,
+            role VARCHAR(20) NOT NULL, entity_id VARCHAR(50) NOT NULL,
+            display_name VARCHAR(255) NOT NULL, password_salt VARCHAR(64) NOT NULL,
+            password_hash VARCHAR(128) NOT NULL, is_active INTEGER NOT NULL DEFAULT 1
+        )""")
+        cursor.execute("""CREATE TABLE IF NOT EXISTS USER_SESSION (
+            token_hash VARCHAR(64) PRIMARY KEY, account_id VARCHAR(50) NOT NULL,
+            expires_at VARCHAR(40) NOT NULL
+        )""")
+        conn.commit()
+        cursor.close()
+        bootstrap_auth_accounts(conn)
+    finally:
+        conn.close()
+
+def bootstrap_auth_accounts(conn) -> None:
+    # Development credentials are supplied in backend/.env and can be changed there.
+    cursor = get_dict_cursor(conn)
+    accounts = [
+        ("admin", "maya@librax.edu", "lib-001", "LIBRAX_ADMIN_PASSWORD"),
+        ("librarian", "arjun@librax.edu", "lib-002", "LIBRAX_LIBRARIAN_PASSWORD"),
+        ("member", "avani@librax.edu", "mem-001", "LIBRAX_MEMBER_PASSWORD"),
+    ]
+    for role, email, entity_id, password_key in accounts:
+        password = os.getenv(password_key)
+        if not password:
+            continue
+        cursor.execute("SELECT account_id FROM USER_ACCOUNT WHERE email = %s", (email,))
+        if cursor.fetchone():
+            continue
+        table, id_column = ("MEMBER", "member_id") if role == "member" else ("LIBRARIAN", "librarian_id")
+        cursor.execute(f"SELECT full_name FROM {table} WHERE {id_column} = %s", (entity_id,))
+        record = cursor.fetchone()
+        if not record:
+            continue
+        salt = secrets.token_hex(16)
+        cursor.execute("""INSERT INTO USER_ACCOUNT
+            (account_id, email, role, entity_id, display_name, password_salt, password_hash, is_active)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, 1)""",
+            (f"acct-{uuid.uuid4().hex}", email, role, entity_id, record["full_name"], salt, password_digest(password, salt)))
+    conn.commit()
+    cursor.close()
+
+def user_payload(row: Dict[str, Any]) -> Dict[str, str]:
+    return {"id": row["account_id"], "entityId": row["entity_id"], "name": row["display_name"], "email": row["email"], "role": row["role"]}
+
+@app.post("/api/auth/login")
+def login(credentials: LoginRequest):
+    rows = execute_query("SELECT * FROM USER_ACCOUNT WHERE LOWER(email) = %s AND is_active = 1", (credentials.email.strip().lower(),))
+    if not rows:
+        raise HTTPException(status_code=401, detail="Email or password is incorrect.")
+    account = rows[0]
+    if not hmac.compare_digest(password_digest(credentials.password, account["password_salt"]), account["password_hash"]):
+        raise HTTPException(status_code=401, detail="Email or password is incorrect.")
+    token = secrets.token_urlsafe(40)
+    expires = datetime.now(timezone.utc) + timedelta(days=SESSION_DAYS)
+    execute_dml("INSERT INTO USER_SESSION (token_hash, account_id, expires_at) VALUES (%s, %s, %s)",
+                (hashlib.sha256(token.encode()).hexdigest(), account["account_id"], expires.isoformat()))
+    return {"token": token, "user": user_payload(account)}
+
+def session_user(request: Request) -> Optional[Dict[str, Any]]:
+    return getattr(request.state, "user", None)
+
+@app.get("/api/auth/me")
+def get_current_user(request: Request):
+    return user_payload(session_user(request))
+
+@app.post("/api/auth/logout", status_code=status.HTTP_204_NO_CONTENT)
+def logout(request: Request):
+    token = request.headers.get("authorization", "").removeprefix("Bearer ")
+    if token:
+        execute_dml("DELETE FROM USER_SESSION WHERE token_hash = %s", (hashlib.sha256(token.encode()).hexdigest(),))
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+@app.post("/api/auth/password", status_code=status.HTTP_204_NO_CONTENT)
+def update_password(body: PasswordChangeRequest, request: Request):
+    account = request.state.user
+    if not hmac.compare_digest(password_digest(body.currentPassword, account["password_salt"]), account["password_hash"]):
+        raise HTTPException(status_code=400, detail="Current password is incorrect.")
+    salt = secrets.token_hex(16)
+    conn = get_connection()
+    try:
+        cursor = get_dict_cursor(conn)
+        cursor.execute("UPDATE USER_ACCOUNT SET password_salt = %s, password_hash = %s WHERE account_id = %s",
+                       (salt, password_digest(body.newPassword, salt), account["account_id"]))
+        token = request.headers.get("authorization", "").removeprefix("Bearer ")
+        current_session = hashlib.sha256(token.encode()).hexdigest()
+        cursor.execute("DELETE FROM USER_SESSION WHERE account_id = %s AND token_hash <> %s",
+                       (account["account_id"], current_session))
+        conn.commit()
+        cursor.close()
+    except Exception:
+        conn.rollback()
+        raise HTTPException(status_code=500, detail="Could not update password.")
+    finally:
+        conn.close()
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+@app.middleware("http")
+async def authenticate_and_authorize(request: Request, call_next):
+    path = request.url.path
+    if request.method == "OPTIONS":
+        return await call_next(request)
+    if not path.startswith("/api/") or path in ("/api/auth/login", "/api/health") or path.startswith("/api/docs") or path == "/api/openapi.json":
+        return await call_next(request)
+    token = request.headers.get("authorization", "")
+    if not token.startswith("Bearer "):
+        return JSONResponse({"detail": "Authentication required."}, status_code=401)
+    token_hash = hashlib.sha256(token[7:].encode()).hexdigest()
+    accounts = execute_query("""SELECT a.* FROM USER_SESSION s JOIN USER_ACCOUNT a ON a.account_id = s.account_id
+        WHERE s.token_hash = %s AND a.is_active = 1""", (token_hash,))
+    if not accounts:
+        return JSONResponse({"detail": "Session expired. Please sign in again."}, status_code=401)
+    account = accounts[0]
+    try:
+        expires_at = datetime.fromisoformat(account.get("expires_at", ""))
+    except ValueError:
+        expires_at = None
+    session_rows = execute_query("SELECT expires_at FROM USER_SESSION WHERE token_hash = %s", (token_hash,))
+    try:
+        expires_at = datetime.fromisoformat(session_rows[0]["expires_at"])
+    except (IndexError, KeyError, ValueError):
+        expires_at = None
+    if not expires_at or expires_at <= datetime.now(timezone.utc):
+        execute_dml("DELETE FROM USER_SESSION WHERE token_hash = %s", (token_hash,))
+        return JSONResponse({"detail": "Session expired. Please sign in again."}, status_code=401)
+    role = account["role"]
+    method = request.method.upper()
+    allowed_roles = None
+    if path.endswith("/auth/me") or path.endswith("/auth/logout") or path.endswith("/auth/password") or path.endswith("/library/snapshot"):
+        allowed_roles = {"admin", "librarian", "member"}
+    elif path.endswith("/db/init"):
+        allowed_roles = {"admin"}
+    elif path.endswith("/members") and method == "POST":
+        allowed_roles = {"admin"}
+    elif path.startswith("/api/members/") and path.endswith("/account") and method == "POST":
+        allowed_roles = {"admin"}
+    elif "/reservations" in path:
+        allowed_roles = {"admin", "librarian", "member"} if method == "POST" else {"admin", "librarian", "member"}
+    elif "/fines/" in path:
+        allowed_roles = {"admin", "librarian"} if method == "PATCH" else {"admin", "librarian", "member"}
+    elif method == "GET":
+        allowed_roles = {"admin", "librarian", "member"}
+    else:
+        allowed_roles = {"admin", "librarian"}
+    if role not in allowed_roles:
+        return JSONResponse({"detail": "Your account does not have permission for this operation."}, status_code=403)
+    request.state.user = account
+    return await call_next(request)
+
+create_auth_schema()
+
 
 # -----------------------------------------------------------------------------
 # Request & Response Schemas
@@ -63,6 +245,7 @@ class BookUpdate(BaseModel):
     isbn: Optional[str] = None
     title: Optional[str] = None
     subtitle: Optional[str] = None
+    authorIds: Optional[List[str]] = None
     publisherId: Optional[str] = None
     categoryId: Optional[str] = None
     publishedYear: Optional[int] = None
@@ -82,6 +265,10 @@ class MemberCreate(BaseModel):
     memberType: Optional[str] = "Student"
     avatarTone: Optional[str] = "#7E9E9A"
     status: Optional[str] = "Active"
+    password: str = Field(min_length=8)
+
+class MemberAccountProvision(BaseModel):
+    password: str = Field(min_length=8)
 
 class BorrowCreate(BaseModel):
     copyId: str
@@ -125,6 +312,7 @@ def map_copy_status_to_db(status_fe: str) -> str:
 def map_reservation_status_to_fe(status_db: str) -> str:
     s = (status_db or "").upper()
     if s == "PENDING": return "queued"
+    if s == "READY": return "ready"
     if s == "FULFILLED": return "fulfilled"
     if s == "CANCELLED": return "cancelled"
     if s == "EXPIRED": return "cancelled"
@@ -132,7 +320,8 @@ def map_reservation_status_to_fe(status_db: str) -> str:
 
 def map_reservation_status_to_db(status_fe: str) -> str:
     s = (status_fe or "").lower()
-    if s in ("queued", "ready"): return "PENDING"
+    if s == "queued": return "PENDING"
+    if s == "ready": return "READY"
     if s == "fulfilled": return "FULFILLED"
     if s == "cancelled": return "CANCELLED"
     return status_fe.upper()
@@ -141,14 +330,14 @@ def map_fine_status_to_fe(status_db: str) -> str:
     s = (status_db or "").upper()
     if s == "UNPAID": return "unpaid"
     if s == "PAID": return "paid"
-    if s == "WAIVED": return "paid"
+    if s == "WAIVED": return "waived"
     return status_db.lower()
 
 def map_fine_status_to_db(status_fe: str) -> str:
     s = (status_fe or "").lower()
     if s == "unpaid": return "UNPAID"
     if s == "paid": return "PAID"
-    if s == "partial": return "UNPAID"
+    if s == "waived": return "WAIVED"
     return status_fe.upper()
 
 
@@ -157,7 +346,7 @@ def map_fine_status_to_db(status_fe: str) -> str:
 # -----------------------------------------------------------------------------
 @app.get("/api/library/snapshot")
 @app.get("/library/snapshot")
-def get_library_snapshot():
+def get_library_snapshot(request: Request):
     """
     Performs relational queries to construct the complete library operational snapshot.
     Fulfills Phase 2 retrieval and reporting requirements.
@@ -288,7 +477,7 @@ def get_library_snapshot():
                 "borrowId": f["borrow_id"],
                 "memberId": m_id,
                 "amount": amt,
-                "daysOverdue": max(0, int(amt / 10)) if f["fine_type"] == "OVERDUE" else 0,
+                "daysOverdue": max(0, round(amt / 10)) if f["fine_type"] == "OVERDUE" else 0,
                 "status": fe_status,
                 "reason": f"Overdue penalty ({f['fine_type']})" if f["fine_type"] == "OVERDUE" else f"{f['fine_type']} book penalty",
                 "assessedAt": str(f["fine_date"])
@@ -329,8 +518,12 @@ def get_library_snapshot():
             ORDER BY reserved_on ASC
         """)
         reservations = []
-        pos = 1
+        queue_positions: Dict[str, int] = {}
         for r in res_raw:
+            position = 0
+            if (r["status"] or "").upper() in ("PENDING", "READY"):
+                position = queue_positions.get(r["book_id"], 0) + 1
+                queue_positions[r["book_id"]] = position
             reservations.append({
                 "id": r["reservation_id"],
                 "bookId": r["book_id"],
@@ -338,9 +531,8 @@ def get_library_snapshot():
                 "placedAt": str(r["reserved_on"]),
                 "expiresAt": str(r["expires_on"]),
                 "status": map_reservation_status_to_fe(r["status"]),
-                "queuePosition": pos
+                "queuePosition": position
             })
-            pos += 1
 
         # 10. Compute Activity Feed from recent borrows, returns, reservations
         activity = [
@@ -362,7 +554,7 @@ def get_library_snapshot():
             }
         ]
 
-        return {
+        snapshot = {
             "books": books,
             "copies": copies,
             "authors": authors,
@@ -375,6 +567,16 @@ def get_library_snapshot():
             "fines": fines,
             "activity": activity
         }
+        user = session_user(request)
+        if user["role"] == "member":
+            member_id = user["entity_id"]
+            snapshot["borrows"] = [item for item in borrows if item["memberId"] == member_id]
+            snapshot["reservations"] = [item for item in reservations if item["memberId"] == member_id]
+            snapshot["fines"] = [item for item in fines if item["memberId"] == member_id]
+            snapshot["members"] = [item for item in members if item["id"] == member_id]
+            snapshot["librarians"] = []
+            snapshot["activity"] = []
+        return snapshot
 
     except Exception as ex:
         raise HTTPException(status_code=500, detail=f"Database retrieval error: {str(ex)}")
@@ -464,6 +666,7 @@ def update_book(book_id: str, updates: BookUpdate):
     updates_dict = updates.model_dump(exclude_unset=True)
     if not updates_dict:
         raise HTTPException(status_code=400, detail="No fields provided to update.")
+    author_ids = updates_dict.pop("authorIds", None)
 
     db_fields = []
     params = []
@@ -485,14 +688,36 @@ def update_book(book_id: str, updates: BookUpdate):
             db_fields.append(f"{mapping[fe_field]} = %s")
             params.append(val)
 
-    if not db_fields:
+    if not db_fields and author_ids is None:
         return {"status": "no change"}
 
-    params.append(book_id)
-    sql = f"UPDATE BOOK SET {', '.join(db_fields)} WHERE book_id = %s"
-    affected = execute_dml(sql, tuple(params))
-    if affected == 0:
-        raise HTTPException(status_code=404, detail="Book not found.")
+    conn = get_connection()
+    try:
+        cursor = get_dict_cursor(conn)
+        cursor.execute("SELECT book_id FROM BOOK WHERE book_id = %s", (book_id,))
+        if not cursor.fetchone():
+            raise HTTPException(status_code=404, detail="Book not found.")
+        if db_fields:
+            params.append(book_id)
+            cursor.execute(f"UPDATE BOOK SET {', '.join(db_fields)} WHERE book_id = %s", tuple(params))
+        if author_ids is not None:
+            for author_id in author_ids:
+                cursor.execute("SELECT author_id FROM AUTHOR WHERE author_id = %s", (author_id,))
+                if not cursor.fetchone():
+                    raise HTTPException(status_code=400, detail=f"Author ID '{author_id}' does not exist.")
+            cursor.execute("DELETE FROM BOOK_AUTHOR WHERE book_id = %s", (book_id,))
+            for order, author_id in enumerate(author_ids, start=1):
+                cursor.execute("INSERT INTO BOOK_AUTHOR (book_id, author_id, author_order) VALUES (%s, %s, %s)", (book_id, author_id, order))
+        conn.commit()
+        cursor.close()
+    except HTTPException:
+        conn.rollback()
+        raise
+    except Exception as ex:
+        conn.rollback()
+        raise HTTPException(status_code=400, detail=f"Failed to update book: {str(ex)}")
+    finally:
+        conn.close()
 
     return {"id": book_id, **updates_dict}
 
@@ -512,11 +737,32 @@ def delete_book(book_id: str):
 @app.patch("/api/book-copies/{copy_id}")
 @app.patch("/book-copies/{copy_id}")
 def update_copy_status(copy_id: str, body: CopyStatusUpdate):
-    db_status = map_copy_status_to_db(body.status)
-    affected = execute_dml("UPDATE BOOK_COPY SET status = %s WHERE copy_id = %s", (db_status, copy_id))
-    if affected == 0:
-        raise HTTPException(status_code=404, detail="Book copy not found.")
-    return {"id": copy_id, "status": body.status}
+    target_status = body.status.lower()
+    if target_status not in {"available", "repair", "lost"}:
+        raise HTTPException(status_code=400, detail="A copy's loan state can only change through issue and return.")
+    conn = get_connection()
+    try:
+        cursor = get_dict_cursor(conn)
+        cursor.execute("SELECT status FROM BOOK_COPY WHERE copy_id = %s", (copy_id,))
+        copy = cursor.fetchone()
+        if not copy:
+            raise HTTPException(status_code=404, detail="Book copy not found.")
+        cursor.execute("SELECT borrow_id FROM BORROW WHERE copy_id = %s AND return_date IS NULL", (copy_id,))
+        active_loan = cursor.fetchone()
+        if copy["status"] == "ON_LOAN" or active_loan:
+            raise HTTPException(status_code=409, detail="Return the active loan before changing this copy's condition.")
+        cursor.execute("UPDATE BOOK_COPY SET status = %s WHERE copy_id = %s", (map_copy_status_to_db(target_status), copy_id))
+        conn.commit()
+        cursor.close()
+        return {"id": copy_id, "status": target_status}
+    except HTTPException:
+        conn.rollback()
+        raise
+    except Exception as ex:
+        conn.rollback()
+        raise HTTPException(status_code=500, detail=f"Failed to update copy status: {str(ex)}")
+    finally:
+        conn.close()
 
 
 # -----------------------------------------------------------------------------
@@ -528,14 +774,24 @@ def create_member(member: MemberCreate):
     mem_id = f"mem-{int(datetime.now().timestamp() * 1000)}"
     db_status = "ACTIVE" if (member.status or "Active").lower() == "active" else "SUSPENDED"
 
+    conn = get_connection()
     try:
-        execute_dml("""
+        cursor = get_dict_cursor(conn)
+        normalized_email = member.email.strip().lower()
+        cursor.execute("""
             INSERT INTO MEMBER (member_id, full_name, email, phone, member_type, join_date, status)
             VALUES (%s, %s, %s, %s, %s, %s, %s)
         """, (
-            mem_id, member.name, member.email, member.phone or "",
+            mem_id, member.name, normalized_email, member.phone or "",
             member.memberType or "Student", date.today(), db_status
         ))
+        salt = secrets.token_hex(16)
+        cursor.execute("""INSERT INTO USER_ACCOUNT
+            (account_id, email, role, entity_id, display_name, password_salt, password_hash, is_active)
+            VALUES (%s, %s, 'member', %s, %s, %s, %s, 1)""",
+            (f"acct-{uuid.uuid4().hex}", normalized_email, mem_id, member.name, salt, password_digest(member.password, salt)))
+        conn.commit()
+        cursor.close()
         return {
             "id": mem_id,
             "memberCode": member.memberCode or f"MBR-{mem_id[-4:]}",
@@ -550,15 +806,54 @@ def create_member(member: MemberCreate):
             "status": member.status or "Active"
         }
     except Exception as ex:
+        conn.rollback()
         raise HTTPException(status_code=400, detail=f"Failed to create member: {str(ex)}")
+    finally:
+        conn.close()
 
+
+@app.post("/api/members/{member_id}/account")
+def provision_member_account(member_id: str, body: MemberAccountProvision):
+    conn = get_connection()
+    try:
+        cursor = get_dict_cursor(conn)
+        cursor.execute("SELECT member_id, full_name, email FROM MEMBER WHERE member_id = %s", (member_id,))
+        member = cursor.fetchone()
+        if not member:
+            raise HTTPException(status_code=404, detail="Member not found.")
+        cursor.execute("SELECT account_id, entity_id FROM USER_ACCOUNT WHERE LOWER(email) = %s", (member["email"].lower(),))
+        existing = cursor.fetchone()
+        if existing and existing["entity_id"] != member_id:
+            raise HTTPException(status_code=409, detail="This email belongs to another account.")
+        salt = secrets.token_hex(16)
+        digest = password_digest(body.password, salt)
+        if existing:
+            cursor.execute("UPDATE USER_ACCOUNT SET password_salt = %s, password_hash = %s, display_name = %s, is_active = 1 WHERE account_id = %s",
+                           (salt, digest, member["full_name"], existing["account_id"]))
+            cursor.execute("DELETE FROM USER_SESSION WHERE account_id = %s", (existing["account_id"],))
+        else:
+            cursor.execute("""INSERT INTO USER_ACCOUNT
+                (account_id, email, role, entity_id, display_name, password_salt, password_hash, is_active)
+                VALUES (%s, %s, 'member', %s, %s, %s, %s, 1)""",
+                (f"acct-{uuid.uuid4().hex}", member["email"].lower(), member_id, member["full_name"], salt, digest))
+        conn.commit()
+        cursor.close()
+        return {"memberId": member_id, "email": member["email"], "loginEnabled": True}
+    except HTTPException:
+        conn.rollback()
+        raise
+    except Exception as ex:
+        conn.rollback()
+        raise HTTPException(status_code=400, detail=f"Could not provision member sign-in: {str(ex)}")
+    finally:
+        conn.close()
 
 # -----------------------------------------------------------------------------
 # Circulation (Borrow & Return) Endpoints with Core Business Logic
 # -----------------------------------------------------------------------------
 @app.post("/api/borrows", status_code=status.HTTP_201_CREATED)
 @app.post("/borrows", status_code=status.HTTP_201_CREATED)
-def issue_borrow(borrow_in: BorrowCreate):
+def issue_borrow(borrow_in: BorrowCreate, request: Request):
     """
     Executes book loan issuance with transaction integrity and business validations:
     - Verifies copy availability (status == 'AVAILABLE')
@@ -615,7 +910,7 @@ def issue_borrow(borrow_in: BorrowCreate):
         cursor.execute("""
             INSERT INTO BORROW (borrow_id, member_id, copy_id, issued_by, borrow_date, due_date)
             VALUES (%s, %s, %s, %s, %s, %s)
-        """, (borrow_id, borrow_in.memberId, borrow_in.copyId, borrow_in.issuedBy, borrow_date, due_date))
+        """, (borrow_id, borrow_in.memberId, borrow_in.copyId, request.state.user["entity_id"], borrow_date, due_date))
 
         # 6. Update copy status to ON_LOAN
         cursor.execute("UPDATE BOOK_COPY SET status = 'ON_LOAN' WHERE copy_id = %s", (borrow_in.copyId,))
@@ -627,7 +922,7 @@ def issue_borrow(borrow_in: BorrowCreate):
             "id": borrow_id,
             "copyId": borrow_in.copyId,
             "memberId": borrow_in.memberId,
-            "issuedBy": borrow_in.issuedBy,
+            "issuedBy": request.state.user["entity_id"],
             "issuedAt": borrow_date.isoformat(),
             "dueAt": due_date.isoformat(),
             "status": "active"
@@ -648,7 +943,7 @@ def issue_borrow(borrow_in: BorrowCreate):
 
 @app.post("/api/borrows/{borrow_id}/return")
 @app.post("/borrows/{borrow_id}/return")
-def return_borrow(borrow_id: str, return_in: ReturnBorrowRequest):
+def return_borrow(borrow_id: str, return_in: ReturnBorrowRequest, request: Request):
     """
     Executes book return with transaction integrity:
     - Sets return_date = TODAY
@@ -680,7 +975,7 @@ def return_borrow(borrow_id: str, return_in: ReturnBorrowRequest):
             UPDATE BORROW
             SET return_date = %s, received_by = %s
             WHERE borrow_id = %s
-        """, (return_date, return_in.receivedBy, borrow_id))
+        """, (return_date, request.state.user["entity_id"], borrow_id))
 
         # 2. Update BOOK_COPY status to AVAILABLE
         cursor.execute("UPDATE BOOK_COPY SET status = 'AVAILABLE' WHERE copy_id = %s", (borrow["copy_id"],))
@@ -702,7 +997,7 @@ def return_borrow(borrow_id: str, return_in: ReturnBorrowRequest):
             "copyId": borrow["copy_id"],
             "memberId": borrow["member_id"],
             "issuedBy": borrow["issued_by"],
-            "receivedBy": return_in.receivedBy,
+            "receivedBy": request.state.user["entity_id"],
             "issuedAt": str(borrow["borrow_date"]),
             "dueAt": str(borrow["due_date"]),
             "returnedAt": return_date.isoformat(),
@@ -728,13 +1023,14 @@ def return_borrow(borrow_id: str, return_in: ReturnBorrowRequest):
 # -----------------------------------------------------------------------------
 @app.post("/api/reservations", status_code=status.HTTP_201_CREATED)
 @app.post("/reservations", status_code=status.HTTP_201_CREATED)
-def create_reservation(res_in: ReservationCreate):
+def create_reservation(res_in: ReservationCreate, request: Request):
     conn = get_connection()
     try:
         cursor = get_dict_cursor(conn)
 
+        member_id = request.state.user["entity_id"] if request.state.user["role"] == "member" else res_in.memberId
         # Validate member
-        cursor.execute("SELECT status FROM MEMBER WHERE member_id = %s", (res_in.memberId,))
+        cursor.execute("SELECT status FROM MEMBER WHERE member_id = %s", (member_id,))
         mem = cursor.fetchone()
         if not mem:
             raise HTTPException(status_code=404, detail="Member not found.")
@@ -745,14 +1041,14 @@ def create_reservation(res_in: ReservationCreate):
         res_date, exp_date = validate_reservation_dates(date.today())
 
         # Queue position calculation
-        cursor.execute("SELECT COUNT(*) AS q_count FROM RESERVATION WHERE book_id = %s AND status = 'PENDING'", (res_in.bookId,))
+        cursor.execute("SELECT COUNT(*) AS q_count FROM RESERVATION WHERE book_id = %s AND status IN ('PENDING', 'READY')", (res_in.bookId,))
         q_pos = cursor.fetchone()["q_count"] + 1
 
         res_id = f"res-{int(datetime.now().timestamp() * 1000)}"
         cursor.execute("""
             INSERT INTO RESERVATION (reservation_id, member_id, book_id, reserved_on, expires_on, status)
             VALUES (%s, %s, %s, %s, %s, 'PENDING')
-        """, (res_id, res_in.memberId, res_in.bookId, res_date, exp_date))
+        """, (res_id, member_id, res_in.bookId, res_date, exp_date))
 
         conn.commit()
         cursor.close()
@@ -760,7 +1056,7 @@ def create_reservation(res_in: ReservationCreate):
         return {
             "id": res_id,
             "bookId": res_in.bookId,
-            "memberId": res_in.memberId,
+            "memberId": member_id,
             "placedAt": res_date.isoformat(),
             "expiresAt": exp_date.isoformat(),
             "status": "queued",
@@ -781,8 +1077,25 @@ def create_reservation(res_in: ReservationCreate):
 
 @app.patch("/api/reservations/{res_id}")
 @app.patch("/reservations/{res_id}")
-def update_reservation_status(res_id: str, body: ReservationStatusUpdate):
+def update_reservation_status(res_id: str, body: ReservationStatusUpdate, request: Request):
+    target = body.status.lower()
+    if target not in {"queued", "ready", "fulfilled", "cancelled"}:
+        raise HTTPException(status_code=400, detail="Unsupported reservation status.")
+    current = execute_query("SELECT member_id, status FROM RESERVATION WHERE reservation_id = %s", (res_id,))
+    if not current:
+        raise HTTPException(status_code=404, detail="Reservation not found.")
+    old_status = current[0]["status"].upper()
+    if request.state.user["role"] == "member":
+        if current[0]["member_id"] != request.state.user["entity_id"]:
+            raise HTTPException(status_code=404, detail="Reservation not found.")
+        if target != "cancelled":
+            raise HTTPException(status_code=403, detail="Members may only cancel their own reservation.")
+    allowed = {"PENDING": {"READY", "FULFILLED", "CANCELLED"}, "READY": {"PENDING", "FULFILLED", "CANCELLED"}}
     db_status = map_reservation_status_to_db(body.status)
+    if db_status == old_status:
+        return {"id": res_id, "status": map_reservation_status_to_fe(old_status)}
+    if db_status not in allowed.get(old_status, set()):
+        raise HTTPException(status_code=400, detail="This reservation can no longer change status.")
     affected = execute_dml("UPDATE RESERVATION SET status = %s WHERE reservation_id = %s", (db_status, res_id))
     if affected == 0:
         raise HTTPException(status_code=404, detail="Reservation not found.")
@@ -794,7 +1107,7 @@ def update_reservation_status(res_id: str, body: ReservationStatusUpdate):
 # -----------------------------------------------------------------------------
 @app.patch("/api/fines/{fine_id}")
 @app.patch("/fines/{fine_id}")
-def update_fine_status(fine_id: str, body: FineStatusUpdate):
+def update_fine_status(fine_id: str, body: FineStatusUpdate, request: Request):
     conn = get_connection()
     try:
         cursor = get_dict_cursor(conn)
@@ -803,7 +1116,17 @@ def update_fine_status(fine_id: str, body: FineStatusUpdate):
         if not fine:
             raise HTTPException(status_code=404, detail="Fine not found.")
 
+        if request.state.user["role"] == "member":
+            cursor.execute("SELECT member_id FROM BORROW WHERE borrow_id = %s", (fine["borrow_id"],))
+            borrow_owner = cursor.fetchone()
+            if not borrow_owner or borrow_owner["member_id"] != request.state.user["entity_id"]:
+                raise HTTPException(status_code=404, detail="Fine not found.")
+            if body.status != "paid":
+                raise HTTPException(status_code=403, detail="Members may only pay their own outstanding fines.")
+
         target_status = map_fine_status_to_db(body.status)
+        if target_status not in ("PAID", "WAIVED"):
+            raise HTTPException(status_code=400, detail="Fine status must be paid or waived.")
         validate_fine_status_transition(fine["status"], target_status)
 
         paid_date = date.today() if target_status == "PAID" else None

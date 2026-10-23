@@ -25,13 +25,12 @@ export function getBookTitle(bookId: string, books: Book[]) { return books.find(
 export function getMemberName(memberId: string, members: LibrarySnapshot['members']) { return members.find((member) => member.id === memberId)?.name ?? 'Unknown member' }
 export function getBorrowDueState(borrow: Borrow) { if (borrow.status === 'returned') return 'returned'; const due = new Date(borrow.dueAt).getTime(); return due < Date.now() ? 'overdue' : 'on-track' }
 export function daysOverdue(borrow: Borrow) { return Math.max(0, Math.ceil((Date.now() - new Date(borrow.dueAt).getTime()) / 86400000)) }
-export function calculateFine(borrow: Borrow, ratePerDay = 8) { return daysOverdue(borrow) * ratePerDay }
 export function dashboardMetrics(snapshot: LibrarySnapshot) {
   const totalCopies = snapshot.copies.length
   const available = snapshot.copies.filter((copy) => copy.status === 'available').length
   const borrowed = snapshot.copies.filter((copy) => copy.status === 'borrowed').length
   const overdue = snapshot.borrows.filter((borrow) => getBorrowDueState(borrow) === 'overdue').length
   const pendingReservations = snapshot.reservations.filter((reservation) => reservation.status === 'queued' || reservation.status === 'ready').length
-  const finesDue = snapshot.fines.filter((fine) => fine.status !== 'paid').reduce((sum, fine) => sum + fine.amount, 0)
+  const finesDue = snapshot.fines.filter((fine) => fine.status === 'unpaid').reduce((sum, fine) => sum + fine.amount, 0)
   return { totalTitles: snapshot.books.length, totalCopies, availableCopies: available, borrowedCopies: borrowed, overdueLoans: overdue, pendingReservations, finesDue, utilization: totalCopies ? Math.round((borrowed / totalCopies) * 100) : 0 }
 }

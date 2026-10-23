@@ -1,6 +1,6 @@
 # LibraX — Library Management System
 
-> **LibraX** is a responsive, role-aware library management frontend designed for a DBMS course project. It provides a complete operational interface for librarians and administrators to manage books, physical copies, members, circulation, reservations, and fines. A MySQL/REST backend is to be developed separately and connected via a clearly defined API boundary.
+> **LibraX** is a responsive library management system with a React frontend and a FastAPI backend. It supports separate administrator, librarian, and member accounts, with role enforcement and member-scoped records.
 
 ---
 
@@ -51,10 +51,10 @@ LibraX ships with the following major areas of functionality:
 - **Borrowing History** — searchable audit log
 - **Analytics** — Recharts-powered charts (category distribution, utilisation trend)
 - **Settings** — application and account preferences
-- **Role switching** — Administrator / Librarian / Member views (demo-only; enforce server-side in production)
+- **Account security** — Server-authenticated Administrator / Librarian / Member roles, password changes, and member account provisioning
 - **Dark mode** — persisted via `localStorage`
 
-All flows work with built-in realistic mock data while a backend is absent.
+The frontend uses the backend API for library records; it does not fall back to mock data.
 
 ---
 
@@ -64,6 +64,7 @@ All flows work with built-in realistic mock data while a backend is absent.
 |---|---|
 | [Node.js](https://nodejs.org/) | 18 LTS |
 | [pnpm](https://pnpm.io/installation) | 10.x |
+| [Python](https://www.python.org/downloads/) | 3.10 or newer |
 | Git | 2.x |
 
 Install pnpm if not present:
@@ -84,14 +85,32 @@ cd LibraX-Library-Management-System
 # 2. Install dependencies
 pnpm install
 
-# 3. Copy the environment template
+# 3. Configure the frontend and backend
 cp .env.example .env
-# Edit .env and set VITE_API_BASE_URL when a backend is available
+cp backend/.env.example backend/.env
+# Change local demo passwords in backend/.env before sharing or exposing the service.
+
+# 4. Install backend dependencies and create a virtual environment
+python3 -m venv .venv
+.venv/bin/python -m pip install -r backend/requirements.txt
 ```
+
+On Windows PowerShell, use `py -m venv .venv` and `.\.venv\Scripts\python.exe -m pip install -r backend\requirements.txt` instead.
 
 ---
 
 ## Local Development
+
+Start the backend in one terminal:
+
+```bash
+cd backend
+../.venv/bin/python -m uvicorn main:app --reload --host 127.0.0.1 --port 8000
+```
+
+On Windows PowerShell, run `cd backend` then `..\.venv\Scripts\python.exe -m uvicorn main:app --reload --host 127.0.0.1 --port 8000`.
+
+Start the frontend in a second terminal at the repository root:
 
 ```bash
 pnpm dev
@@ -99,7 +118,9 @@ pnpm dev
 
 The Vite dev server starts on **http://localhost:3000** with hot module replacement.
 
-Run type checking separately (no build required):
+The API health check is at **http://localhost:8000/api/health** and the interactive API docs are at **http://localhost:8000/docs**.
+
+Run type checking separately:
 
 ```bash
 pnpm typecheck
@@ -129,10 +150,11 @@ Copy `.env.example` to `.env` and fill in the values:
 # .env.example — safe to commit; .env is git-ignored
 
 # The base URL for the REST backend.
-# Leave empty to use the built-in mock API (all pages remain fully functional).
-# Example: VITE_API_BASE_URL=https://api.yourbackend.edu/v1
-VITE_API_BASE_URL=
+# Local FastAPI backend
+VITE_API_BASE_URL=http://localhost:8000/api
 ```
+
+The backend reads database and local account settings from `backend/.env`. `USE_SQLITE_FALLBACK=true` uses the included local SQLite database; MySQL connection variables are also available in `backend/.env.example`.
 
 > **Security**: Never store MySQL passwords, JDBC connection strings, private tokens, or any secret in `VITE_*` variables — they are inlined into the browser bundle. All privileged credentials belong exclusively in the backend runtime.
 
@@ -168,9 +190,7 @@ librax/
 │   │   ├── login.tsx
 │   │   └── operations.ts        # Re-export barrel
 │   ├── services/
-│   │   ├── api.ts               # LibraryApi interface + HTTP implementation
-│   │   ├── mockApi.ts           # In-memory mock; selected when VITE_API_BASE_URL is absent
-│   │   └── mockData.ts          # Seed data (not production data)
+│   │   └── api.ts               # Auth and backend HTTP client
 │   ├── types/
 │   │   └── index.ts             # Domain interfaces and status enums
 │   ├── lib/
@@ -178,7 +198,8 @@ librax/
 │   ├── index.css                # Design tokens, Tailwind base, component classes
 │   ├── main.tsx                 # React root, QueryClient, providers
 │   └── vite-env.d.ts            # Vite env type declaration
-├── .env.example                 # Safe template (committed)
+├── backend/                     # FastAPI service, business rules, and database adapter
+├── .env.example                 # Frontend local configuration template
 ├── .gitignore
 ├── app.config.ts                # App-level config (logo path, etc.)
 ├── index.html                   # Vite entry HTML
@@ -200,12 +221,11 @@ librax/
 | Area | Status |
 |---|---|
 | API contract (`LibraryApi` interface) | ✅ Defined in `src/services/api.ts` |
-| HTTP client (`httpApi`) | ✅ Activated by setting `VITE_API_BASE_URL` |
-| Mock fallback (`mockApi`) | ✅ Active when `VITE_API_BASE_URL` is empty |
-| Environment variable wiring | ✅ `.env.example` provided with CORS notes |
-| Auth headers & 401 interception | ✅ Auto Bearer token dispatch + 401 redirect to `/login` |
-| Backend server | ⏳ Not yet implemented |
-| Authentication backend (JWT / session) | ⏳ Demo role switcher; wire token via `setToken()` |
+| HTTP client (`httpApi`) | ✅ Uses the FastAPI service configured by `VITE_API_BASE_URL` |
+| Backend server | ✅ FastAPI API with SQLite fallback and MySQL configuration |
+| Authentication | ✅ Hashed passwords, expiring server sessions, and role checks |
+| Member data access | ✅ Member loans, reservations, and fines are scoped to the signed-in member |
+| Circulation and fines | ✅ API-backed issue/return, reservation, copy-status, and fine workflows |
 | Pagination / server-side filtering | ⏳ Pages currently load a full snapshot |
 | Real-time / websocket updates | ⏳ Not implemented |
 
@@ -229,9 +249,9 @@ The frontend communicates exclusively through the `LibraryApi` interface in `src
 | `PATCH` | `/reservations/:id` | Update reservation status |
 | `PATCH` | `/fines/:id` | Update fine payment status |
 
-All requests include `Content-Type: application/json` and automatically attach `Authorization: Bearer <token>` when an auth token is set. Responses are JSON (or 204 No Content for empty DELETE responses). If a `401 Unauthorized` status is received, the frontend automatically purges stored tokens and routes to `/login`. Errors use non-2xx status codes and may include an error body.
+Authentication endpoints include `POST /auth/login`, `GET /auth/me`, `POST /auth/logout`, and `POST /auth/password`. The member account endpoint is `POST /members/{member_id}/account` and is administrator-only. Protected requests include `Authorization: Bearer <token>`. If a `401 Unauthorized` status is received, the frontend clears the stored token and routes to `/login`.
 
-> When the backend is ready, set `VITE_API_BASE_URL` in `.env` — the frontend automatically switches from mock to live data.
+The API documentation is available at `http://localhost:8000/docs` while the backend is running.
 
 ---
 
@@ -247,18 +267,17 @@ All requests include `Content-Type: application/json` and automatically attach `
 | `RESERVATION` | `reservationId` | `bookId`, `memberId`; queue position and lifecycle status |
 | `FINE` | `fineId` | `borrowId`, `memberId`; overdue days, amount, payment status |
 
-Derived values (availability, overdue state, fine amount) are computed client-side in `src/lib/utils.ts`. In production the backend should be authoritative and enforce them transactionally.
+The backend is authoritative for copy availability, overdue status, fine assessment, and role checks. The frontend formats and displays the values returned in the library snapshot.
 
 ---
 
-## Remaining Integration Work
+## Local demo accounts
 
-1. Implement the REST resources matching `LibraryApi` in the chosen backend (Java/JDBC, Spring Boot, Express, etc.)
-2. Replace the snapshot endpoint with paginated, filterable responses as data grows
-3. Implement real authentication — enforce role claims server-side; the role switcher is demo-only
-4. Make issue/return, reservation transitions, and fine assessment atomic (MySQL transactions)
-5. Add backend contract tests for copy availability checks, overdue windows, and fine rate rules
-6. Secure the API with HTTPS and CORS restrictions before deployment
+The backend example environment file contains local placeholders for the accounts `maya@librax.edu` (admin), `arjun@librax.edu` (librarian), and `avani@librax.edu` (member). Copy it to `backend/.env` and set your own passwords before the first backend start. These credentials are for local development only; change them before exposing the service or using real data.
+
+## Deployment notes
+
+The included configuration is intended for local development. Before deployment, configure private credentials, a production database, HTTPS, and restricted CORS origins. The API currently returns a full library snapshot rather than paginating records.
 
 ---
 

@@ -2,7 +2,9 @@ export type Role = 'admin' | 'librarian' | 'member'
 export type CopyStatus = 'available' | 'borrowed' | 'repair' | 'lost'
 export type BorrowStatus = 'active' | 'returned' | 'overdue'
 export type ReservationStatus = 'queued' | 'ready' | 'fulfilled' | 'cancelled'
-export type PaymentStatus = 'unpaid' | 'partial' | 'paid'
+export type PaymentStatus = 'unpaid' | 'paid' | 'waived'
+
+export interface AuthUser { id: string; entityId: string; name: string; email: string; role: Role }
 
 export interface Author { id: string; name: string; initials: string; books: number; status: 'Active' | 'Draft' }
 export interface Publisher { id: string; name: string; city: string; books: number; status: 'Active' | 'Draft' }

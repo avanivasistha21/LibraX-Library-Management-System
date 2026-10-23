@@ -1,4 +1,4 @@
-import type { Book, BookCopy, Borrow, Fine, LibrarySnapshot, Member, Reservation } from '@/types'
+import type { AuthUser, Book, BookCopy, Borrow, Fine, LibrarySnapshot, Member, Reservation } from '@/types'
 
 export interface LibraryApi {
   getSnapshot(): Promise<LibrarySnapshot>
@@ -6,13 +6,15 @@ export interface LibraryApi {
   updateBook(id: string, input: Partial<Book>): Promise<Book>
   deleteBook(id: string): Promise<void>
   updateCopyStatus(id: string, status: BookCopy['status']): Promise<BookCopy>
-  createMember(input: Omit<Member, 'id'>): Promise<Member>
+  createMember(input: Omit<Member, 'id'> & { password: string }): Promise<Member>
   createBorrow(input: Pick<Borrow, 'copyId' | 'memberId' | 'issuedBy' | 'dueAt'>): Promise<Borrow>
   returnBorrow(id: string, receivedBy: string): Promise<Borrow>
   createReservation(input: Pick<Reservation, 'bookId' | 'memberId'>): Promise<Reservation>
   updateReservationStatus(id: string, status: Reservation['status']): Promise<Reservation>
   updateFineStatus(id: string, status: Fine['status']): Promise<Fine>
 }
+
+export interface LoginResult { token: string; user: AuthUser }
 
 const baseUrl = import.meta.env.VITE_API_BASE_URL?.replace(/\/$/, '')
 const TOKEN_KEY = 'librax_auth_token'
@@ -80,4 +82,24 @@ export const httpApi: LibraryApi = {
   createReservation: (input) => request('/reservations', { method: 'POST', body: JSON.stringify(input) }),
   updateReservationStatus: (id, status) => request(`/reservations/${id}`, { method: 'PATCH', body: JSON.stringify({ status }) }),
   updateFineStatus: (id, status) => request(`/fines/${id}`, { method: 'PATCH', body: JSON.stringify({ status }) }),
+}
+
+export async function login(email: string, password: string): Promise<LoginResult> {
+  return request('/auth/login', { method: 'POST', body: JSON.stringify({ email, password }) })
+}
+
+export async function getCurrentUser(): Promise<AuthUser> {
+  return request('/auth/me')
+}
+
+export async function logout(): Promise<void> {
+  await request('/auth/logout', { method: 'POST' })
+}
+
+export async function changePassword(currentPassword: string, newPassword: string): Promise<void> {
+  await request('/auth/password', { method: 'POST', body: JSON.stringify({ currentPassword, newPassword }) })
+}
+
+export async function setMemberPassword(memberId: string, password: string): Promise<void> {
+  await request('/members/' + encodeURIComponent(memberId) + '/account', { method: 'POST', body: JSON.stringify({ password }) })
 }

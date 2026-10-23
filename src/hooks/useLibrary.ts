@@ -1,7 +1,7 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { getLibraryApi } from '@/services/mockApi'
+import { httpApi, setMemberPassword } from '@/services/api'
 import type { Book, Fine, Member, Reservation } from '@/types'
-const api = getLibraryApi()
+const api = httpApi
 export const libraryQueryKey = ['library-snapshot']
 export function useLibrary() { return useQuery({ queryKey: libraryQueryKey, queryFn: api.getSnapshot, staleTime: 30_000 }) }
 export function useBookMutation() { const qc = useQueryClient(); return useMutation({ mutationFn: async (input: { id?: string; payload: Partial<Book>; mode: 'create' | 'update' | 'delete' }) => { if (input.mode === 'delete' && input.id) { await api.deleteBook(input.id); return } if (input.mode === 'update' && input.id) { await api.updateBook(input.id, input.payload); return } await api.createBook(input.payload as Omit<Book, 'id' | 'createdAt'>) }, onSuccess: () => qc.invalidateQueries({ queryKey: libraryQueryKey }) }) }
@@ -9,6 +9,7 @@ export function useCopyStatusMutation() { const qc = useQueryClient(); return us
 export function useReservationMutation() { const qc = useQueryClient(); return useMutation({ mutationFn: ({ id, status }: { id: string; status: Reservation['status'] }) => api.updateReservationStatus(id, status), onSuccess: () => qc.invalidateQueries({ queryKey: libraryQueryKey }) }) }
 export function useCreateReservationMutation() { const qc = useQueryClient(); return useMutation({ mutationFn: (input: Pick<Reservation, 'bookId' | 'memberId'>) => api.createReservation(input), onSuccess: () => qc.invalidateQueries({ queryKey: libraryQueryKey }) }) }
 export function useFineMutation() { const qc = useQueryClient(); return useMutation({ mutationFn: ({ id, status }: { id: string; status: Fine['status'] }) => api.updateFineStatus(id, status), onSuccess: () => qc.invalidateQueries({ queryKey: libraryQueryKey }) }) }
-export function useMemberMutation() { const qc = useQueryClient(); return useMutation({ mutationFn: (input: Omit<Member, 'id'>) => api.createMember(input), onSuccess: () => qc.invalidateQueries({ queryKey: libraryQueryKey }) }) }
+export function useMemberMutation() { const qc = useQueryClient(); return useMutation({ mutationFn: (input: Omit<Member, 'id'> & { password: string }) => api.createMember(input), onSuccess: () => qc.invalidateQueries({ queryKey: libraryQueryKey }) }) }
+export function useProvisionMemberAccountMutation() { return useMutation({ mutationFn: ({ memberId, password }: { memberId: string; password: string }) => setMemberPassword(memberId, password) }) }
 export function useBorrowMutation() { const qc = useQueryClient(); return useMutation({ mutationFn: (input: { copyId: string; memberId: string; issuedBy: string; dueAt: string }) => api.createBorrow(input), onSuccess: () => qc.invalidateQueries({ queryKey: libraryQueryKey }) }) }
 export function useReturnMutation() { const qc = useQueryClient(); return useMutation({ mutationFn: ({ id, receivedBy }: { id: string; receivedBy: string }) => api.returnBorrow(id, receivedBy), onSuccess: () => qc.invalidateQueries({ queryKey: libraryQueryKey }) }) }
