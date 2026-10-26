@@ -11,6 +11,7 @@ interface Session {
   email: string
   loading: boolean
   login: (email: string, password: string) => Promise<void>
+  register: (input: authApi.RegisterInput) => Promise<void>
   signOut: () => void
 }
 
@@ -36,6 +37,13 @@ export function SessionProvider({ children }: { children: ReactNode }) {
     setUser(result.user)
   }
 
+  const register = async (input: authApi.RegisterInput) => {
+    const result = await authApi.register(input)
+    queryClient.clear()
+    setAuthToken(result.token)
+    setUser(result.user)
+  }
+
   const signOut = () => {
     void authApi.logout().catch(() => undefined)
     queryClient.clear()
@@ -50,6 +58,7 @@ export function SessionProvider({ children }: { children: ReactNode }) {
     email: user?.email ?? '',
     loading,
     login,
+    register,
     signOut,
   }), [user, loading])
 

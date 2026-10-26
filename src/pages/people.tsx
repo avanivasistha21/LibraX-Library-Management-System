@@ -1,5 +1,6 @@
 import { KeyRound, Mail, Plus, UserPlus, UsersRound } from 'lucide-react'
 import { useState } from 'react'
+import { useSearchParams } from 'react-router-dom'
 import { Avatar, Badge, Button, Drawer, ErrorState, Field, Input, LoadingState, SearchInput, Select } from '@/components/ui'
 import { useLibrary, useMemberMutation, useProvisionMemberAccountMutation } from '@/hooks/useLibrary'
 import { formatCurrency, formatDate } from '@/lib/utils'
@@ -13,7 +14,8 @@ export function PeoplePage() {
   const provisionAccount = useProvisionMemberAccountMutation()
   const [tab, setTab] = useState<'members' | 'librarians'>('members')
   const [search, setSearch] = useState('')
-  const [open, setOpen] = useState(false)
+  const [searchParams] = useSearchParams()
+  const [open, setOpen] = useState(() => searchParams.get('action') === 'add')
   const [draft, setDraft] = useState(emptyDraft)
   const [accountMember, setAccountMember] = useState<Member | null>(null)
   const [accountPassword, setAccountPassword] = useState('')
@@ -45,7 +47,7 @@ export function PeoplePage() {
       <Field label="Initial password" hint="At least 8 characters. Members can change it in account settings."><div className="relative"><KeyRound className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-400" /><Input className="pl-10" type="password" minLength={8} autoComplete="new-password" value={draft.password} onChange={(event) => setDraft({ ...draft, password: event.target.value })} /></div></Field>
       <Field label="Phone"><Input value={draft.phone} onChange={(event) => setDraft({ ...draft, phone: event.target.value })} placeholder="+91 …" /></Field>
       <Field label="Member type"><Select className="w-full" value={draft.memberType} onChange={(event) => setDraft({ ...draft, memberType: event.target.value as typeof draft.memberType })}><option>Student</option><option>Faculty</option><option>Staff</option></Select></Field>
-      {addMember.isError && <p role="alert" className="text-sm text-red-700">Could not create member. Check whether this email is already in use.</p>}
+      {addMember.isError && <p role="alert" className="text-sm text-red-700">{addMember.error instanceof Error ? addMember.error.message : 'Could not create member. Check whether this email is already in use.'}</p>}
       <div className="flex justify-end gap-2 border-t border-line pt-5"><Button variant="outline" onClick={() => setOpen(false)}>Cancel</Button><Button onClick={() => void saveMember()} disabled={addMember.isPending || !draft.name || !draft.email || draft.password.length < 8}>{addMember.isPending ? 'Adding…' : 'Add member'}</Button></div>
     </div></Drawer>
     <Drawer open={Boolean(accountMember)} onClose={() => setAccountMember(null)} title="Set member login" description={accountMember ? `Assign a password for ${accountMember.name}. Resetting it signs out their existing sessions.` : undefined}><div className="space-y-5">

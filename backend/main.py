@@ -53,6 +53,13 @@ class LoginRequest(BaseModel):
     email: str
     password: str
 
+class RegisterRequest(BaseModel):
+    name: str
+    email: str
+    password: str = Field(min_length=8)
+    memberType: Optional[str] = "Student"
+    phone: Optional[str] = ""
+
 class PasswordChangeRequest(BaseModel):
     currentPassword: str
     newPassword: str = Field(min_length=8)
@@ -91,14 +98,13 @@ def bootstrap_auth_accounts(conn) -> None:
     # Development credentials are supplied in backend/.env and can be changed there.
     cursor = get_dict_cursor(conn)
     accounts = [
-        ("admin", "maya@librax.edu", "lib-001", "LIBRAX_ADMIN_PASSWORD"),
-        ("librarian", "arjun@librax.edu", "lib-002", "LIBRAX_LIBRARIAN_PASSWORD"),
-        ("member", "avani@librax.edu", "mem-001", "LIBRAX_MEMBER_PASSWORD"),
+        ("admin", "maya@librax.edu", "lib-001", "LIBRAX_ADMIN_PASSWORD", "change-this-admin-password"),
+        ("librarian", "arjun@librax.edu", "lib-002", "LIBRAX_LIBRARIAN_PASSWORD", "change-this-librarian-password"),
+        ("member", "avani@librax.edu", "mem-001", "LIBRAX_MEMBER_PASSWORD", "change-this-member-password"),
+        ("member", "ustat@librax.edu", "mem-002", "LIBRAX_MEMBER_PASSWORD", "change-this-member-password"),
     ]
-    for role, email, entity_id, password_key in accounts:
-        password = os.getenv(password_key)
-        if not password:
-            continue
+    for role, email, entity_id, password_key, default_pwd in accounts:
+        password = os.getenv(password_key) or default_pwd
         cursor.execute("SELECT account_id FROM USER_ACCOUNT WHERE email = %s", (email,))
         if cursor.fetchone():
             continue
@@ -131,6 +137,68 @@ def login(credentials: LoginRequest):
     execute_dml("INSERT INTO USER_SESSION (token_hash, account_id, expires_at) VALUES (%s, %s, %s)",
                 (hashlib.sha256(token.encode()).hexdigest(), account["account_id"], expires.isoformat()))
     return {"token": token, "user": user_payload(account)}
+
+@app.post("/api/auth/register", status_code=status.HTTP_201_CREATED)
+def register(body: RegisterRequest):
+    normalized_email = body.email.strip().lower()
+    if not normalized_email or "@" not in normalized_email:
+        raise HTTPException(status_code=400, detail="A valid email address is required.")
+    if not body.name.strip():
+        raise HTTPException(status_code=400, detail="Name is required.")
+    if len(body.password) < 8:
+        raise HTTPException(status_code=400, detail="Password must be at least 8 characters.")
+
+    conn = get_connection()
+    try:
+        cursor = get_dict_cursor(conn)
+        cursor.execute("SELECT account_id FROM USER_ACCOUNT WHERE LOWER(email) = %s", (normalized_email,))
+        if cursor.fetchone():
+            raise HTTPException(status_code=409, detail="An account with this email already exists.")
+        cursor.execute("SELECT member_id FROM MEMBER WHERE LOWER(email) = %s", (normalized_email,))
+        if cursor.fetchone():
+            raise HTTPException(status_code=409, detail="A member with this email already exists.")
+
+        mem_id = f"mem-{int(datetime.now().timestamp() * 1000)}"
+        join_date = date.today().isoformat()
+        member_type = body.memberType or "Student"
+        cursor.execute("""
+            INSERT INTO MEMBER (member_id, full_name, email, phone, member_type, join_date, status)
+            VALUES (%s, %s, %s, %s, %s, %s, 'ACTIVE')
+        """, (mem_id, body.name.strip(), normalized_email, body.phone or "", member_type, join_date))
+
+        salt = secrets.token_hex(16)
+        account_id = f"acct-{uuid.uuid4().hex}"
+        cursor.execute("""
+            INSERT INTO USER_ACCOUNT (account_id, email, role, entity_id, display_name, password_salt, password_hash, is_active)
+            VALUES (%s, %s, 'member', %s, %s, %s, %s, 1)
+        """, (account_id, normalized_email, mem_id, body.name.strip(), salt, password_digest(body.password, salt)))
+
+        token = secrets.token_urlsafe(40)
+        expires = datetime.now(timezone.utc) + timedelta(days=SESSION_DAYS)
+        cursor.execute("""
+            INSERT INTO USER_SESSION (token_hash, account_id, expires_at)
+            VALUES (%s, %s, %s)
+        """, (hashlib.sha256(token.encode()).hexdigest(), account_id, expires.isoformat()))
+
+        conn.commit()
+        cursor.close()
+
+        account = {
+            "account_id": account_id,
+            "entity_id": mem_id,
+            "display_name": body.name.strip(),
+            "email": normalized_email,
+            "role": "member"
+        }
+        return {"token": token, "user": user_payload(account)}
+    except HTTPException:
+        conn.rollback()
+        raise
+    except Exception as ex:
+        conn.rollback()
+        raise HTTPException(status_code=500, detail=f"Registration failed: {str(ex)}")
+    finally:
+        conn.close()
 
 def session_user(request: Request) -> Optional[Dict[str, Any]]:
     return getattr(request.state, "user", None)
@@ -175,7 +243,7 @@ async def authenticate_and_authorize(request: Request, call_next):
     path = request.url.path
     if request.method == "OPTIONS":
         return await call_next(request)
-    if not path.startswith("/api/") or path in ("/api/auth/login", "/api/health") or path.startswith("/api/docs") or path == "/api/openapi.json":
+    if not path.startswith("/api/") or path in ("/api/auth/login", "/api/auth/register", "/api/health") or path.startswith("/api/docs") or path == "/api/openapi.json":
         return await call_next(request)
     token = request.headers.get("authorization", "")
     if not token.startswith("Bearer "):
@@ -206,13 +274,13 @@ async def authenticate_and_authorize(request: Request, call_next):
     elif path.endswith("/db/init"):
         allowed_roles = {"admin"}
     elif path.endswith("/members") and method == "POST":
-        allowed_roles = {"admin"}
+        allowed_roles = {"admin", "librarian"}
     elif path.startswith("/api/members/") and path.endswith("/account") and method == "POST":
-        allowed_roles = {"admin"}
+        allowed_roles = {"admin", "librarian"}
     elif "/reservations" in path:
         allowed_roles = {"admin", "librarian", "member"} if method == "POST" else {"admin", "librarian", "member"}
     elif "/fines/" in path:
-        allowed_roles = {"admin", "librarian"} if method == "PATCH" else {"admin", "librarian", "member"}
+        allowed_roles = {"admin", "librarian", "member"}
     elif method == "GET":
         allowed_roles = {"admin", "librarian", "member"}
     else:

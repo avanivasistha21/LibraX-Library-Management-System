@@ -16,6 +16,14 @@ export interface LibraryApi {
 
 export interface LoginResult { token: string; user: AuthUser }
 
+export interface RegisterInput {
+  name: string
+  email: string
+  password: string
+  memberType?: string
+  phone?: string
+}
+
 const baseUrl = import.meta.env.VITE_API_BASE_URL?.replace(/\/$/, '')
 const TOKEN_KEY = 'librax_auth_token'
 
@@ -51,16 +59,30 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
   })
 
   if (response.status === 401) {
-    clearAuthToken()
-    if (typeof window !== 'undefined' && window.location.pathname !== '/login') {
-      window.location.href = '/login'
+    let message = 'Unauthorized: Session expired or invalid token.'
+    try {
+      const errorBody = await response.json()
+      if (errorBody?.detail) message = errorBody.detail
+    } catch {}
+    if (path !== '/auth/login') {
+      clearAuthToken()
+      if (typeof window !== 'undefined' && window.location.pathname !== '/login') {
+        window.location.href = '/login'
+      }
     }
-    throw new Error('Unauthorized: Session expired or invalid token.')
+    throw new Error(message)
   }
 
   if (!response.ok) {
-    const errorBody = await response.text().catch(() => '')
-    throw new Error(`API request failed with status ${response.status}${errorBody ? `: ${errorBody}` : ''}`)
+    let message = `API request failed with status ${response.status}`
+    try {
+      const errorJson = await response.json()
+      if (errorJson?.detail) message = errorJson.detail
+    } catch {
+      const errorBody = await response.text().catch(() => '')
+      if (errorBody) message += `: ${errorBody}`
+    }
+    throw new Error(message)
   }
 
   if (response.status === 204) {
@@ -86,6 +108,10 @@ export const httpApi: LibraryApi = {
 
 export async function login(email: string, password: string): Promise<LoginResult> {
   return request('/auth/login', { method: 'POST', body: JSON.stringify({ email, password }) })
+}
+
+export async function register(input: RegisterInput): Promise<LoginResult> {
+  return request('/auth/register', { method: 'POST', body: JSON.stringify(input) })
 }
 
 export async function getCurrentUser(): Promise<AuthUser> {

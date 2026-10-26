@@ -32,7 +32,7 @@ export default function App() {
         <Route path="/history" element={<HistoryPage />} />
         <Route path="/settings" element={<SettingsPage />} />
         <Route path="/copies" element={<RoleRoute roles={['admin', 'librarian']}><CopiesPage /></RoleRoute>} />
-        <Route path="/people" element={<RoleRoute roles={['admin']}><PeoplePage /></RoleRoute>} />
+        <Route path="/people" element={<RoleRoute roles={['admin', 'librarian']}><PeoplePage /></RoleRoute>} />
         <Route path="/metadata" element={<RoleRoute roles={['admin']}><MetadataPage /></RoleRoute>} />
         <Route path="/circulation" element={<RoleRoute roles={['admin', 'librarian']}><CirculationPage /></RoleRoute>} />
         <Route path="/analytics" element={<RoleRoute roles={['admin', 'librarian']}><AnalyticsPage /></RoleRoute>} />
